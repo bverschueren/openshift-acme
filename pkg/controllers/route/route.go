@@ -31,6 +31,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	authorizationv1 "k8s.io/api/authorization/v1"
 
 	"github.com/tnozicka/openshift-acme/pkg/acme/challengeexposers"
 	acmeclient "github.com/tnozicka/openshift-acme/pkg/acme/client"
@@ -561,7 +562,38 @@ func (rc *RouteController) handle(key string) error {
 				return fmt.Errorf("failed to update route %s/%s with new certificates: %v", route.Namespace, route.Name, err)
 			}
 
-			rc.recorder.Event(updatedRoute, corev1.EventTypeNormal, "AcmeCertificateProvisioned", "Successfully provided new certificate")
+			unprivilegedSameNamespace := route.Namespace == rc.selfNamespace && rc.selfSelector != nil
+			if unprivilegedSameNamespace {
+				// In single-namespace mode we are not allowed to create events by default.
+				// And since we log an error while trying to create an event without authorization,
+				// let's check if we are allowed beforehand.
+				var sar *authorizationv1.SelfSubjectAccessReview
+				sar = &authorizationv1.SelfSubjectAccessReview{
+					Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+						ResourceAttributes: &authorizationv1.ResourceAttributes{
+							Namespace: route.Namespace,
+							Verb: "create",
+							Resource: "events",
+						},
+					},
+				}
+				SelfSARClient := rc.kubeClientset.AuthorizationV1()
+				response, err := SelfSARClient.SelfSubjectAccessReviews().Create(sar)
+				if err != nil {
+					glog.Errorf("failed to perform SelfSubjectAccessReview")
+				}else{
+					if response.Status.Allowed {
+						// We're allowed to create events, so let's do it.
+						rc.recorder.Event(updatedRoute, corev1.EventTypeNormal, "AcmeCertificateProvisioned", "Successfully provided new certificate")
+					}else{
+						// We're not allowed, but still mention so.
+						glog.V(4).Infof("failed to create events in single-namespace mode without 'create' authorization.")
+					}
+				}
+			}else{
+				// Not in single-namespace, so just create the Event.
+				rc.recorder.Event(updatedRoute, corev1.EventTypeNormal, "AcmeCertificateProvisioned", "Successfully provided new certificate")
+			}
 
 			// Clean up tmp objects on success.
 			// We should make this more smart when we support more exposers.
